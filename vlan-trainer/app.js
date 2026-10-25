@@ -123,7 +123,7 @@ function newSwitch(id) {
     vlans: new Map([[1, 'default'], [1002, 'fddi-default'], [1003, 'token-ring-default'], [1004, 'fddinet-default'], [1005, 'trnet-default']]),
     cli: {
       buf: ['Cisco IOS Software, C2960 Software (C2960-LANBASEK9-M), Version 15.0(2)SE4, RELEASE SOFTWARE (fc1)', 'Technical Support: http://www.cisco.com/techsupport', 'Copyright (c) 1986-2013 by Cisco Systems, Inc.', 'Compiled Wed 26-Jun-13 02:49 by mnguyen', '', '', 'Press RETURN to get started!', ''],
-      mode: 'boot', ctx: null, hist: [], hi: 0, busy: null, ask: null, plen: 0, view: null, modeSet: false, queue: null,
+      mode: 'boot', ctx: null, hist: [], hi: 0, busy: null, ask: null, plen: 0, view: null, modeSet: false, queue: null, termLen: 24, more: null,
     },
   };
 }
@@ -273,6 +273,7 @@ function out(sw, ...lines) {
 function promptText(sw) {
   const c = sw.cli;
   if (c.busy) return '';
+  if (c.more) return ' --More-- ';
   if (c.ask) return c.ask.q;
   if (c.mode === 'boot') return '';
   return sw.hostname + SUFFIX[c.mode];
@@ -287,12 +288,29 @@ function linkMsg(sw, p, state) {
   const n = longName(p);
   out(sw, '', `%LINK-5-CHANGED: Interface ${n}, changed state to ${state}`, '', `%LINEPROTO-5-UPDOWN: Line protocol on Interface ${n}, changed state to ${state === 'up' ? 'up' : 'down'}`, '');
 }
+const protoMsg = (sw, p, state) => out(sw, '', `%LINEPROTO-5-UPDOWN: Line protocol on Interface ${longName(p)}, changed state to ${state}`, '');
 const caret = (sw, pos) => out(sw, ' '.repeat(sw.cli.plen + pos) + '^', "% Invalid input detected at '^' marker.", '');
+// IOS pauses long output at the terminal length (24 by default): Space = next page, Enter = next line, any other key stops
+function page(sw, lines) {
+  const c = sw.cli, n = c.termLen - 1;
+  if (c.termLen === 0 || lines.length <= n) return out(sw, ...lines);
+  out(sw, ...lines.slice(0, n));
+  c.more = lines.slice(n);
+}
+function moreKey(sw, key) {
+  const c = sw.cli;
+  if (key === ' ') out(sw, ...c.more.splice(0, c.termLen - 1));
+  else if (key === 'Enter') out(sw, c.more.shift());
+  else c.more = [];
+  if (!c.more.length) c.more = null;
+  refreshPrompt(sw);
+}
 
 // ---------- command handlers ----------
 function setMode(sw, m, ctx = null) { sw.cli.mode = m; sw.cli.ctx = ctx; sw.cli.modeSet = true; }
 function ask(sw, q, fn) { sw.cli.ask = { q, fn }; }
 function logout(sw) { setMode(sw, 'boot'); out(sw, '', `${sw.hostname} con0 is now available`, '', '', '', '', '', 'Press RETURN to get started.', ''); }
+const toPriv = sw => setMode(sw, 'priv');
 const configured = sw => out(sw, '%SYS-5-CONFIG_I: Configured from console by console');
 function enterConf(sw) { out(sw, 'Enter configuration commands, one per line.  End with CNTL/Z.'); setMode(sw, 'conf'); }
 function confAsk(sw) {
@@ -321,31 +339,47 @@ function noVlan(sw, id) {
   if (isDefaultVlan(id)) return out(sw, `%Default VLAN ${id} may not be deleted.`);
   sw.vlans.delete(id);
 }
+const IF_TYPES = [['fastethernet', 'Fa', 24], ['gigabitethernet', 'Gig', 2], ['port-channel', null], ['vlan', null]];
 function parseIfs(str, multi) {
-  if (!multi && /[-,]/.test(str)) return { err: str.search(/[-,]/) };
+  if (!multi) {
+    const tl = /^\s*[a-zA-Z-]*/.exec(str)[0].length, k = str.slice(tl).search(/[-,]/);
+    if (k >= 0) return { err: tl + k };
+  }
   const res = [];
   let off = 0;
   for (const part of str.split(',')) {
     const at = off + (part.length - part.trimStart().length);
     off += part.length + 1;
-    const m = /^([a-zA-Z]+)\s*(\d+)\/(\d+)(?:\s*-\s*(\d+))?$/.exec(part.trim());
-    if (!m) return { err: at };
-    const ty = m[1].toLowerCase();
-    const T = 'fastethernet'.startsWith(ty) ? { p: 'Fa', max: 24 } : 'gigabitethernet'.startsWith(ty) ? { p: 'Gig', max: 2 } : null;
-    if (!T || m[2] !== '0') return { err: at };
-    const a = +m[3], b = m[4] ? +m[4] : a;
-    if (a < 1 || b > T.max || b < a) return { err: at };
-    for (let n = a; n <= b; n++) res.push(`${T.p}0/${n}`);
+    const p = part.trim(), tm = /^[a-zA-Z-]*/.exec(p)[0], ty = tm.toLowerCase();
+    const T = ty && IF_TYPES.find(([full]) => full.startsWith(ty));
+    if (!T) return { err: at + Math.max(0, ...IF_TYPES.map(([full]) => { let i = 0; while (i < ty.length && full[i] === ty[i]) i++; return i; })) };
+    if (!T[1]) return { stub: true };
+    const numPart = p.slice(tm.length), sp = numPart.length - numPart.trimStart().length;
+    const m = /^(\d+)\/(\d+)(?:\s*-\s*(\d+))?$/.exec(numPart.trim());
+    if (!m || m[1] !== '0') return { err: at + tm.length + sp };
+    const a = +m[2], b = m[3] ? +m[3] : a;
+    if (a < 1 || a > T[2] || b > T[2] || b < a) return { err: at + p.indexOf('/') + 1 };
+    for (let n = a; n <= b; n++) res.push(`${T[1]}0/${n}`);
   }
   return { ports: [...new Set(res)] };
 }
 function enterIf(sw, rest, multi, at) {
   const r = parseIfs(rest.trimEnd(), multi);
   if (r.err != null) return caret(sw, at + r.err);
+  if (r.stub) return stubMsg(sw, `interface ${multi ? 'range ' : ''}${rest.trim()}`);
   setMode(sw, multi ? 'range' : 'if', r.ports);
 }
 const eachPort = (sw, fn) => { for (const p of sw.cli.ctx) fn(sw.ports[p], p); };
-const setPortMode = (sw, mode) => eachPort(sw, pt => { pt.mode = mode; });
+function setPortMode(sw, mode) {
+  const before = sw.cli.ctx.map(p => portOper(sw.id, p));
+  eachPort(sw, pt => { pt.mode = mode; });
+  sw.cli.ctx.forEach((p, i) => {
+    const l = linkAt(sw.id, p);
+    if (!l || portOper(sw.id, p) === before[i]) return;
+    const o = otherEnd(l, sw.id, p);
+    for (const [s, q] of [[sw, p], [S.switches[o.dev], o.port]]) if (s) { protoMsg(s, q, 'down'); protoMsg(s, q, 'up'); }
+  });
+}
 function setAccess(sw, v) {
   if (!sw.vlans.has(v)) { out(sw, `% Access VLAN does not exist. Creating vlan ${v}`); sw.vlans.set(v, 'VLAN' + pad4(v)); }
   eachPort(sw, pt => { pt.access = v; });
@@ -359,7 +393,10 @@ function setShut(sw, val) {
 }
 const writeMem = sw => out(sw, 'Building configuration...', '[OK]');
 const copyRun = sw => ask(sw, 'Destination filename [startup-config]? ', () => writeMem(sw));
-const doCmd = (sw, args, rest, at) => dispatch(sw, rest, at, PRIV);
+// "do" keeps you in the sub-mode you typed it from
+const doCmd = (sw, args, rest, at) => { dispatch(sw, rest, at, PRIV); sw.cli.modeSet = true; };
+const stubMsg = (sw, text) => out(sw, `% [Trainer] "${text}" is a real command, but this trainer doesn't simulate it.`, '');
+const stubRun = (sw, args, rest) => stubMsg(sw, [...args, rest || ''].join(' ').trim());
 
 function showVlan(sw) {
   const L = ['', 'VLAN Name                             Status    Ports', '---- -------------------------------- --------- -------------------------------'];
@@ -370,7 +407,7 @@ function showVlan(sw) {
     L.push(`${String(id).padEnd(4)} ${sw.vlans.get(id).padEnd(32)} ${'active'.padEnd(9)} ${chunks[0] || ''}`.trimEnd());
     for (const ch of chunks.slice(1)) L.push(' '.repeat(48) + ch);
   }
-  out(sw, ...L, '');
+  page(sw, [...L, '']);
 }
 function showTrunk(sw) {
   const tr = ALL_PORTS.filter(p => portOper(sw.id, p) === 'trunk');
@@ -378,11 +415,11 @@ function showTrunk(sw) {
   const active = [...sw.vlans.keys()].filter(v => v < 1002).sort((a, b) => a - b).join(',');
   const c = (s, w) => s.padEnd(w);
   const mode = p => ({ trunk: 'on', 'dynamic desirable': 'desirable', 'dynamic auto': 'auto' }[sw.ports[p].mode] || 'on');
-  out(sw, c('Port', 12) + c('Mode', 13) + c('Encapsulation', 15) + c('Status', 14) + 'Native vlan',
+  page(sw, [c('Port', 12) + c('Mode', 13) + c('Encapsulation', 15) + c('Status', 14) + 'Native vlan',
     ...tr.map(p => c(p, 12) + c(mode(p), 13) + c('802.1q', 15) + c('trunking', 14) + '1'),
     '', c('Port', 12) + 'Vlans allowed on trunk', ...tr.map(p => c(p, 12) + '1-1005'),
     '', c('Port', 12) + 'Vlans allowed and active in management domain', ...tr.map(p => c(p, 12) + active),
-    '', c('Port', 12) + 'Vlans in spanning tree forwarding state and not pruned', ...tr.map(p => c(p, 12) + active), '');
+    '', c('Port', 12) + 'Vlans in spanning tree forwarding state and not pruned', ...tr.map(p => c(p, 12) + active), '']);
 }
 function showRun(sw) {
   const L = ['!', 'version 15.0', 'no service timestamps log datetime msec', 'no service timestamps debug datetime msec', 'no service password-encryption', '!', `hostname ${sw.hostname}`, '!', '!', '!'];
@@ -399,39 +436,83 @@ function showRun(sw) {
     L.push('!');
   }
   L.push('interface Vlan1', ' no ip address', ' shutdown', '!', '!', '!', '!', 'line con 0', '!', 'line vty 0 4', ' login', 'line vty 5 15', ' login', '!', '!', '!', '!', 'end');
-  out(sw, 'Building configuration...', '', `Current configuration : ${L.join('\n').length + 1} bytes`, ...L, '');
+  page(sw, ['Building configuration...', '', `Current configuration : ${L.join('\n').length + 1} bytes`, ...L, '']);
 }
 
 // ---------- command trees ----------
+// Keyword lists follow Packet Tracer's 2960 so short forms clash (or not) the same way. Commands outside the exam are stubs.
 const num = (lo, hi) => s => /^\d+$/.test(s) && +s >= lo && +s <= hi;
 const WORD = s => s.length > 0 && s.length <= 32;
-const IF_HELP = [['FastEthernet', 'FastEthernet IEEE 802.3'], ['GigabitEthernet', 'GigabitEthernet IEEE 802.3z']];
+const IF_HELP = [['FastEthernet', 'FastEthernet IEEE 802.3'], ['GigabitEthernet', 'GigabitEthernet IEEE 802.3z'], ['Port-channel', 'Ethernet Channel of interfaces'], ['Vlan', 'Catalyst Vlans']];
+const stub = (k, h = '') => ({ k, h, run: stubRun, kids: [{ rest: true, a: 'LINE', h: '', run: stubRun }] });
+const stubs = list => list.map(([k, h]) => stub(k, h));
 const exitNode = { k: 'exit', h: 'Exit from the EXEC', run: exitMode };
+const logoutNode = { k: 'logout', h: 'Exit from the EXEC', run: logout };
+const enableNode = run => ({ k: 'enable', h: 'Turn on privileged commands', run, kids: [{ a: '<0-15>', h: 'Enable level', t: num(0, 15), num: true, run }, stub('view', 'Set into the existing view')] });
+const termNode = { k: 'terminal', h: 'Set terminal line parameters', kids: [
+  { k: 'length', h: 'Set number of lines on a screen', kids: [{ a: '<0-512>', h: 'Number of lines on screen (0 for no pausing)', t: num(0, 512), num: true, run: (sw, a) => { sw.cli.termLen = +a[2]; } }] },
+  ...stubs([['history', 'Enable and control the command history function'], ['monitor', 'Copy debug output to the current terminal line'], ['no', 'Negate a command or set its defaults'], ['width', 'Set width of the display terminal']]),
+] };
+const showVlanNode = { k: 'vlan', h: 'VTP VLAN status', run: showVlan, kids: [
+  { k: 'brief', h: 'VTP all VLAN status in brief', run: showVlan },
+  ...stubs([['id', 'VTP VLAN status by VLAN id'], ['name', 'VTP VLAN status by VLAN name'], ['summary', 'VLAN summary information']]),
+] };
+const showIfNode = { k: 'interfaces', h: 'Interface status and configuration', run: stubRun, kids: [
+  { k: 'trunk', h: 'Show interface trunk information', run: showTrunk },
+  ...stubs([['status', 'Show interface line status'], ['switchport', 'Show interface switchport information']]),
+  { rest: true, ifspec: true, run: (sw, a, rest, at) => { const r = parseIfs(rest.trimEnd(), false); if (r.err != null) return caret(sw, at + r.err); stubMsg(sw, 'show interfaces ' + rest.trim()); } },
+] };
+const SHOW_BASE = [['arp', 'Arp table'], ['cdp', 'CDP information'], ['clock', 'Display the system clock'], ['crypto', 'Encryption Module'], ['dtp', 'DTP information'], ['etherchannel', 'EtherChannel information'],
+  ['flash:', 'display information about flash: file system'], ['history', 'Display the session command history'], ['ip', 'IP information'], ['mac-address-table', 'MAC forwarding table'],
+  ['mls', 'Show MultiLayer Switching information'], ['privilege', 'Show current privilege level'], ['sessions', 'Information about Telnet connections'], ['ssh', 'Status of SSH server connections'],
+  ['tcp', 'Status of TCP connections'], ['terminal', 'Display terminal configuration parameters'], ['users', 'Display information about terminal lines'], ['version', 'System hardware and software status']];
+const SHOW_USER = { k: 'show', h: 'Show running system information', kids: [...stubs(SHOW_BASE), showIfNode, showVlanNode] };
 const SHOW = { k: 'show', h: 'Show running system information', kids: [
-  { k: 'vlan', h: 'VTP VLAN status', run: showVlan, kids: [{ k: 'brief', h: 'VTP all VLAN status in brief', run: showVlan }] },
-  { k: 'interfaces', h: 'Interface status and configuration', kids: [{ k: 'trunk', h: 'Show interface trunk information', run: showTrunk }] },
+  ...stubs([...SHOW_BASE, ['aaa', 'Show AAA values'], ['access-lists', 'List access lists'], ['boot', 'show boot attributes'], ['dhcp', 'Dynamic Host Configuration Protocol status'],
+    ['hosts', 'IP domain-name, lookup style, nameservers, and host table'], ['ipv6', 'IPv6 information'], ['lldp', 'LLDP information'], ['logging', 'Show the contents of logging buffers'],
+    ['mac', 'MAC configuration'], ['monitor', 'Monitoring different system events'], ['ntp', 'Network time protocol'], ['port-security', 'Show secure port information'],
+    ['processes', 'Active process statistics'], ['sdm', 'Switch Database Management'], ['snmp', 'snmp statistics'], ['spanning-tree', 'Spanning tree topology'],
+    ['startup-config', 'Contents of startup configuration'], ['storm-control', 'Show storm control configuration'], ['tech-support', 'Show system information for Tech-Support'], ['vtp', 'VTP information']]),
+  showIfNode, showVlanNode,
   { k: 'running-config', h: 'Current operating configuration', run: showRun },
 ] };
+const EXEC_STUBS = [['connect', 'Open a terminal connection'], ['disconnect', 'Disconnect an existing network connection'], ['ping', 'Send echo messages'], ['resume', 'Resume an active network connection'],
+  ['ssh', 'Open a secure shell client connection'], ['telnet', 'Open a telnet connection'], ['traceroute', 'Trace route to destination']];
 const USER = [
-  { k: 'enable', h: 'Turn on privileged commands', run: sw => setMode(sw, 'priv') },
-  exitNode,
-  { k: 'logout', h: 'Exit from the EXEC', run: logout },
+  ...stubs(EXEC_STUBS),
+  { k: 'disable', h: 'Turn off privileged commands', run: () => {} },
+  enableNode(toPriv), exitNode, logoutNode, SHOW_USER, termNode,
 ];
 const PRIV = [
-  { k: 'enable', h: 'Turn on privileged commands', run: () => {} },
+  ...stubs([...EXEC_STUBS, ['clear', 'Reset functions'], ['clock', 'Manage the system clock'], ['debug', "Debugging functions (see also 'undebug')"], ['delete', 'Delete a file'],
+    ['dir', 'List files on a filesystem'], ['erase', 'Erase a filesystem'], ['more', 'Display the contents of a file'], ['no', 'Disable debugging informations'],
+    ['reload', 'Halt and perform a cold restart'], ['setup', 'Run the SETUP command facility'], ['undebug', "Disable debugging functions (see also 'debug')"]]),
+  enableNode(() => {}),
   { k: 'disable', h: 'Turn off privileged commands', run: sw => setMode(sw, 'user') },
-  { k: 'configure', h: 'Enter configuration mode', run: confAsk, kids: [{ k: 'terminal', h: 'Configure from the terminal', run: enterConf }] },
-  { k: 'copy', h: 'Copy from one file to another', kids: [{ k: 'running-config', h: 'Copy from current system configuration', kids: [{ k: 'startup-config', h: 'Copy to startup configuration', run: copyRun }] }] },
-  { k: 'write', h: 'Write running configuration to memory', run: writeMem, kids: [{ k: 'memory', h: 'Write to NV memory', run: writeMem }] },
-  SHOW, exitNode,
-  { k: 'logout', h: 'Exit from the EXEC', run: logout },
+  { k: 'configure', h: 'Enter configuration mode', run: confAsk, kids: [{ k: 'terminal', h: 'Configure from the terminal', run: enterConf }, ...stubs([['memory', 'Configure from NV memory'], ['network', 'Configure from a TFTP network host']])] },
+  { k: 'copy', h: 'Copy from one file to another', kids: [
+    { k: 'running-config', h: 'Copy from current system configuration', kids: [{ k: 'startup-config', h: 'Copy to startup configuration', run: copyRun }, ...stubs([['flash:', 'Copy to flash: file system'], ['tftp:', 'Copy to tftp: file system']])] },
+    ...stubs([['flash:', 'Copy from flash: file system'], ['startup-config', 'Copy from startup configuration'], ['tftp:', 'Copy from tftp: file system']]),
+  ] },
+  { k: 'write', h: 'Write running configuration to memory, NVRAM, network, or terminal', run: writeMem, kids: [{ k: 'memory', h: 'Write to NV memory', run: writeMem }, ...stubs([['erase', 'Erase NV memory'], ['terminal', 'Write to terminal']])] },
+  { k: 'vlan', h: 'Configure VLAN parameters', kids: [stub('database', 'Configure VLAN database')] },
+  SHOW, exitNode, logoutNode, termNode,
 ];
-const endNode = { k: 'end', h: 'Exit from configure mode', run: endConf };
 const doNode = { k: 'do', h: 'To run exec commands in config mode', kids: [{ rest: true, a: 'LINE', h: 'Exec Command', run: doCmd }] };
 const lookupOff = sw => { sw.lookup = false; };
 const lookupOn = sw => { sw.lookup = true; };
-const vlanArg = run => ({ a: '<1-4094>', h: 'ISL VLAN IDs 1-1005', t: num(1, 4094), run });
+const vlanArg = run => ({ a: '<1-4094>', h: 'ISL VLAN IDs 1-1005', t: num(1, 4094), num: true, run });
+const CONF_STUBS = [['aaa', 'Authentication, Authorization and Accounting.'], ['access-list', 'Add an access list entry'], ['banner', 'Define a login banner'], ['boot', 'Boot Commands'],
+  ['cdp', 'Global CDP configuration subcommands'], ['class-map', 'Configure Class Map'], ['clock', 'Configure time-of-day clock'], ['crypto', 'Encryption module'], ['errdisable', 'Error disable'],
+  ['ipv6', 'Global IPv6 configuration commands'], ['line', 'Configure a terminal line'], ['lldp', 'Global LLDP configuration subcommands'], ['logging', 'Modify message logging facilities'],
+  ['mac', 'MAC configuration'], ['mac-address-table', 'Configure the MAC address table'], ['mls', 'mls global commands'], ['monitor', 'Monitoring different system events'], ['ntp', 'Configure NTP'],
+  ['parser', 'Configure parser'], ['policy-map', 'Configure QoS Policy Map'], ['port-channel', 'EtherChannel configuration'], ['privilege', 'Command privilege parameters'],
+  ['radius-server', 'Modify Radius query parameters'], ['sdm', 'Switch Database Management'], ['secure', 'Secure image and configuration archival commands'], ['service', 'Modify use of network based services'],
+  ['snmp-server', 'Modify SNMP engine parameters'], ['spanning-tree', 'Spanning Tree Subsystem'], ['system', 'system config command'], ['tacacs-server', 'Modify TACACS query parameters'],
+  ['username', 'Establish User Name Authentication'], ['vtp', 'Configure global VTP state']];
+const IP_STUBS = [['default-gateway', 'Specify default gateway (if not routing IP)'], ['domain-name', 'Define the default domain name'], ['http', 'HTTP server configuration'], ['ssh', 'Configure ssh options']];
 const CONF = [
+  ...stubs(CONF_STUBS),
   { k: 'vlan', h: 'Vlan commands', kids: [vlanArg((sw, a) => enterVlan(sw, +a[1]))] },
   { k: 'interface', h: 'Select an interface to configure', kids: [
     { k: 'range', h: 'interface range command', kids: [{ rest: true, ifspec: true, run: (sw, a, rest, at) => enterIf(sw, rest, true, at) }] },
@@ -440,52 +521,73 @@ const CONF = [
   { k: 'hostname', h: "Set system's network name", kids: [{ a: 'WORD', h: "This system's network name", t: WORD, run: (sw, a) => { sw.hostname = a[1]; } }] },
   { k: 'ip', h: 'Global IP configuration subcommands', kids: [
     { k: 'domain-lookup', h: 'Enable IP Domain Name System hostname translation', run: lookupOn },
-    { k: 'domain', h: 'IP DNS Resolver', kids: [{ k: 'lookup', h: 'Enable IP Domain Name System hostname translation', run: lookupOn }] },
+    { k: 'domain', h: 'IP DNS Resolver', kids: [{ k: 'lookup', h: 'Enable IP Domain Name System hostname translation', run: lookupOn }, stub('name', 'Define the default domain name')] },
+    ...stubs(IP_STUBS),
   ] },
   { k: 'no', h: 'Negate a command or set its defaults', kids: [
+    ...stubs(CONF_STUBS),
     { k: 'vlan', h: 'Vlan commands', kids: [vlanArg((sw, a) => noVlan(sw, +a[2]))] },
     { k: 'ip', h: 'Global IP configuration subcommands', kids: [
       { k: 'domain-lookup', h: 'Enable IP Domain Name System hostname translation', run: lookupOff },
-      { k: 'domain', h: 'IP DNS Resolver', kids: [{ k: 'lookup', h: 'Enable IP Domain Name System hostname translation', run: lookupOff }] },
+      { k: 'domain', h: 'IP DNS Resolver', kids: [{ k: 'lookup', h: 'Enable IP Domain Name System hostname translation', run: lookupOff }, stub('name', 'Define the default domain name')] },
+      ...stubs(IP_STUBS),
     ] },
     { k: 'hostname', h: "Set system's network name", run: sw => { sw.hostname = 'Switch'; } },
+    ...stubs([['enable', 'Modify enable password parameters'], ['interface', 'Select an interface to configure']]),
   ] },
   { k: 'enable', h: 'Modify enable password parameters', kids: [
     { k: 'secret', h: 'Assign the privileged level secret', kids: [{ a: 'WORD', h: 'The UNENCRYPTED (cleartext) secret', t: WORD, run: () => {} }] },
     { k: 'password', h: 'Assign the privileged level password', kids: [{ a: 'WORD', h: 'The UNENCRYPTED (cleartext) password', t: WORD, run: () => {} }] },
   ] },
-  endNode, { k: 'exit', h: 'Exit from configure mode', run: exitMode }, doNode,
+  { k: 'end', h: 'Exit from configure mode', run: endConf },
+  { k: 'exit', h: 'Exit from configure mode', run: exitMode },
+  doNode,
 ];
+// Sub-modes list only their own commands, like PT's "?"; end, do and global commands fall back to CONF in dispatch()
 const VLANM = [
   { k: 'name', h: 'Ascii name of the VLAN', kids: [{ a: 'WORD', h: 'The ascii name for the VLAN', t: WORD, run: (sw, a) => setVlanName(sw, a[1]) }] },
   { k: 'no', h: 'Negate a command or set its defaults', kids: [{ k: 'name', h: 'Ascii name of the VLAN', run: sw => { if (!isDefaultVlan(sw.cli.ctx)) sw.vlans.set(sw.cli.ctx, 'VLAN' + pad4(sw.cli.ctx)); } }] },
-  endNode, { k: 'exit', h: 'Apply changes, bump revision number, and exit mode', run: exitMode }, doNode,
+  { k: 'exit', h: 'Apply changes, bump revision number, and exit mode', run: exitMode },
 ];
 const modeKids = [
   { k: 'access', h: 'Set trunking mode to ACCESS unconditionally', run: sw => setPortMode(sw, 'access') },
-  { k: 'trunk', h: 'Set trunking mode to TRUNK unconditionally', run: sw => setPortMode(sw, 'trunk') },
   { k: 'dynamic', h: 'Set trunking mode to dynamically negotiate access or trunk mode', kids: [
     { k: 'auto', h: 'Set trunking mode dynamic negotiation parameter to AUTO', run: sw => setPortMode(sw, 'dynamic auto') },
     { k: 'desirable', h: 'Set trunking mode dynamic negotiation parameter to DESIRABLE', run: sw => setPortMode(sw, 'dynamic desirable') },
   ] },
+  { k: 'trunk', h: 'Set trunking mode to TRUNK unconditionally', run: sw => setPortMode(sw, 'trunk') },
 ];
+const SWP_STUBS = [['nonegotiate', 'Device will not engage in negotiation protocol on this interface'], ['port-security', 'Security related command'], ['priority', 'Set appliance 802.1p priority'],
+  ['protected', 'Configure an interface to be a protected port'], ['voice', 'Voice appliance attributes']];
+const IF_STUBS = [['arp', 'Set arp type (arpa, probe, snap) or timeout'], ['bandwidth', 'Set bandwidth informational parameter'], ['cdp', 'CDP interface subcommands'],
+  ['channel-group', 'Etherchannel/port bundling configuration'], ['channel-protocol', 'Select the channel protocol (LACP, PAgP)'], ['duplex', 'Configure duplex operation.'],
+  ['ip', 'Interface Internet Protocol config commands'], ['ipv6', 'IPv6 interface subcommands'], ['lldp', 'LLDP interface subcommands'], ['mdix', 'Set Media-dependent interface crossover'],
+  ['mls', 'mls interface commands'], ['spanning-tree', 'Spanning Tree Subsystem'], ['speed', 'Configure speed operation.'], ['storm-control', 'storm configuration'],
+  ['tx-ring-limit', 'Configure PA level transmit ring limit']];
 const IFM = [
+  ...stubs(IF_STUBS),
   { k: 'switchport', h: 'Set switching mode characteristics', kids: [
+    { k: 'access', h: 'Set access mode characteristics of the interface', kids: [{ k: 'vlan', h: 'Set VLAN when interface is in access mode', kids: [{ ...vlanArg((sw, a) => setAccess(sw, +a[3])), h: 'VLAN ID of the VLAN when this port is in access mode' }] }] },
     { k: 'mode', h: 'Set trunking mode of the interface', kids: modeKids },
-    { k: 'access', h: 'Set access mode characteristics of the interface', kids: [{ k: 'vlan', h: 'Set VLAN when interface is in access mode', kids: [vlanArg((sw, a) => setAccess(sw, +a[3]))] }] },
-    { k: 'trunk', h: 'Set trunking characteristics of the interface', kids: [{ k: 'native', h: 'Set trunking native characteristics', kids: [{ k: 'vlan', h: 'Set native VLAN when interface is in trunking mode', kids: [vlanArg(() => {})] }] }] },
+    { k: 'trunk', h: 'Set trunking characteristics of the interface', kids: [
+      { k: 'native', h: 'Set trunking native characteristics when interface is in trunking mode', kids: [{ k: 'vlan', h: 'Set native VLAN when interface is in trunking mode', kids: [vlanArg(() => {})] }] },
+      ...stubs([['allowed', 'Set allowed VLAN characteristics when interface is in trunking mode'], ['pruning', 'Set pruning VLAN characteristics when interface is in trunking mode']]),
+    ] },
+    ...stubs(SWP_STUBS),
   ] },
   { k: 'shutdown', h: 'Shutdown the selected interface', run: sw => setShut(sw, true) },
   { k: 'description', h: 'Interface specific description', kids: [{ rest: true, a: 'LINE', h: 'Up to 240 characters describing this interface', run: () => {} }] },
   { k: 'no', h: 'Negate a command or set its defaults', kids: [
+    ...stubs(IF_STUBS),
     { k: 'shutdown', h: 'Shutdown the selected interface', run: sw => setShut(sw, false) },
     { k: 'switchport', h: 'Set switching mode characteristics', kids: [
       { k: 'access', h: 'Set access mode characteristics of the interface', kids: [{ k: 'vlan', h: 'Set VLAN when interface is in access mode', run: sw => eachPort(sw, pt => { pt.access = 1; }) }] },
       { k: 'mode', h: 'Set trunking mode of the interface', run: sw => setPortMode(sw, 'dynamic auto') },
+      ...stubs([['trunk', 'Set trunking characteristics of the interface'], ...SWP_STUBS]),
     ] },
     { k: 'description', h: 'Interface specific description', run: () => {} },
   ] },
-  endNode, { k: 'exit', h: 'Exit from interface configuration mode', run: exitMode }, doNode,
+  { k: 'exit', h: 'Exit from interface configuration mode', run: exitMode },
 ];
 const TREES = { user: USER, priv: PRIV, conf: CONF, vlan: VLANM, if: IFM, range: IFM };
 
@@ -501,19 +603,32 @@ function matchKw(opts, s) {
   const ex = opts.filter(n => n.k === low);
   return ex.length ? ex : opts.filter(n => n.k && n.k.startsWith(low));
 }
+// IOS puts the caret on the first character no command at this level could accept
+function prefixLen(opts, s) {
+  const low = s.toLowerCase();
+  let best = 0;
+  for (const n of opts) {
+    let i = 0;
+    if (n.k) while (i < low.length && i < n.k.length && n.k[i] === low[i]) i++;
+    else if (n.num) { const d = /^\d*/.exec(s)[0].length; i = d === s.length ? 0 : d; }
+    best = Math.max(best, i);
+  }
+  return best;
+}
 function parse(tree, line) {
   const toks = tokenize(line);
   let opts = tree, node = null;
   const args = [];
-  for (const t of toks) {
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
     const kws = matchKw(opts, t.s);
-    if (kws.length > 1) return { err: 'ambig', pos: t.pos };
+    if (kws.length > 1) return { err: 'ambig', pos: t.pos, tok: i };
     if (kws.length === 1) { node = kws[0]; args.push(node.k); opts = node.kids || []; continue; }
     const an = opts.find(n => n.t && n.t(t.s));
     if (an) { node = an; args.push(t.s); opts = an.kids || []; continue; }
     const rn = opts.find(n => n.rest);
     if (rn) return { node: rn, args, rest: line.slice(t.pos), restPos: t.pos };
-    return { err: 'invalid', pos: t.pos };
+    return { err: 'invalid', pos: t.pos + prefixLen(opts, t.s), tok: i };
   }
   if (!node) return { err: 'empty' };
   if (!node.run) return { err: 'incomplete' };
@@ -542,10 +657,11 @@ function dispatch(sw, line, offset = 0, forced = null) {
     // IOS falls back to global config commands from a sub-mode
     const r2 = parse(CONF, line);
     if (!r2.err) { run(sw, r2, offset); if (!sw.cli.modeSet) setMode(sw, 'conf'); return; }
-    if (r.err === 'invalid' && r2.err === 'invalid' && r2.pos > r.pos) r = r2;
+    if (r.err === 'invalid' && (r2.err !== 'invalid' ? r.tok === 0 : r2.pos > r.pos)) r = r2;
   }
   if (r.err) {
-    if (!forced && (mode === 'user' || mode === 'priv') && r.err === 'invalid' && r.pos === 0) return lookup(sw, tokenize(line)[0].s);
+    // An unknown first word in EXEC mode is treated as a host name to telnet to
+    if (!forced && (mode === 'user' || mode === 'priv') && r.err === 'invalid' && r.tok === 0) return lookup(sw, tokenize(line)[0].s);
     if (r.err === 'ambig') return out(sw, `% Ambiguous command: "${line.trim()}"`, '');
     if (r.err === 'incomplete') return out(sw, '% Incomplete command.', '');
     return caret(sw, offset + r.pos);
@@ -571,6 +687,7 @@ function abortLookup(sw) {
 function submit(sw, v) {
   const c = sw.cli;
   if (c.busy) return;
+  c.more = null;
   if (c.mode === 'boot') { out(sw, ''); c.mode = 'user'; refreshPrompt(sw); return; }
   if (c.ask) { const a = c.ask; out(sw, a.q + v); c.ask = null; a.fn(v); refreshPrompt(sw); onChange(); return; }
   const p = promptText(sw);
@@ -592,7 +709,7 @@ function complete(sw, text) {
     const c = matchKw(w.opts, last.s);
     if (c.length === 1) return text.slice(0, last.pos) + c[0].k + ' ';
     if (c.length > 1) return null;
-    if (w.opts.some(n => n.ifspec) && /^[a-z]+$/i.test(last.s)) {
+    if (w.opts.some(n => n.ifspec) && /^[a-z-]+$/i.test(last.s)) {
       const t = IF_HELP.find(([n]) => n.toLowerCase().startsWith(last.s.toLowerCase()));
       if (t) return text.slice(0, last.pos) + t[0];
     }
@@ -610,16 +727,21 @@ function help(sw, text) {
     if (partial) {
       const c = w.inRest ? [] : matchKw(w.opts, partial.s);
       if (!c.length) continue;
-      out(sw, c.map(n => n.k).join('  '), '');
+      out(sw, c.map(n => n.k).sort().join('  '), '');
       return;
     }
-    const L = [];
+    const args = [], kws = [];
     for (const n of w.opts) {
-      if (n.ifspec) IF_HELP.forEach(([a, b]) => L.push('  ' + a.padEnd(18) + b));
-      else L.push('  ' + (n.k || n.a || 'LINE').padEnd(18) + (n.h || ''));
+      if (n.ifspec) kws.push(...IF_HELP);
+      else if (n.k) kws.push([n.k, n.h || '']);
+      else args.push([n.a || 'LINE', n.h || '']);
     }
+    kws.sort((a, b) => a[0].toLowerCase().localeCompare(b[0].toLowerCase()));
+    const rows = [...args, ...kws];
+    const wd = Math.max(0, ...rows.map(r => r[0].length)) + 2;
+    const L = rows.map(([a, b]) => '  ' + a.padEnd(wd) + b);
     if (w.node && w.node.run) L.push('  <cr>');
-    out(sw, ...L, '');
+    page(sw, [...L, '']);
     return;
   }
   out(sw, '% Unrecognized command', '');
@@ -1100,8 +1222,15 @@ function cliKey(sw, e) {
   if (e.ctrlKey && e.shiftKey && (e.code === 'Digit6' || e.key === '^' || e.key === '6' || e.key === '&')) { e.preventDefault(); abortLookup(sw); return; }
   if (e.ctrlKey && e.key === 'F6') { e.preventDefault(); inp.blur(); return; }
   if (c.busy || c.queue) { if (e.key.length === 1 || e.key === 'Enter') e.preventDefault(); return; }
+  if (c.more) { if (!['Shift', 'Control', 'Alt', 'Meta'].includes(e.key)) { e.preventDefault(); moreKey(sw, e.key); } return; }
   if (e.ctrlKey && !e.shiftKey && !e.altKey) {
     const k = e.key.toLowerCase(), v = inp.value, at = inp.selectionStart;
+    if (k === 'c' && inp.selectionStart === inp.selectionEnd && c.mode !== 'boot' && !c.ask) {
+      e.preventDefault();
+      out(sw, promptText(sw) + v + '^C'); inp.value = '';
+      if (CONF_MODES.has(c.mode)) endConf(sw);
+      refreshPrompt(sw); onChange(); return;
+    }
     if (k === 'a') { e.preventDefault(); inp.setSelectionRange(0, 0); return; }
     if (k === 'e') { e.preventDefault(); inp.setSelectionRange(v.length, v.length); return; }
     if (k === 'u') { e.preventDefault(); inp.value = v.slice(at); inp.setSelectionRange(0, 0); return; }
