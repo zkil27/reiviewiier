@@ -912,7 +912,7 @@ function finish() {
 // ---------- UI rendering ----------
 function renderStatus() {
   const st = $('#status');
-  st.className = 'chip' + (S.tEnd ? ' done' : S.t0 ? ' run' : '');
+  st.className = 'chip' + (S.tEnd ? ' is-done' : S.t0 ? ' is-run' : '');
   st.textContent = S.tEnd ? 'Finished' : S.t0 ? 'Running' : 'Ready';
 }
 function renderTimer() { if (S) $('#timer').textContent = fmt(elapsed()); }
@@ -996,7 +996,11 @@ function linkSvg(l) {
   let s = `<g class="link" data-link="${l.id}"><line class="cable-hit" x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}"/><line class="cable" x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}"/>`;
   s += `<circle cx="${la[0]}" cy="${la[1]}" r="4.5" fill="${ledColor(l, l.a)}"/><circle cx="${lb[0]}" cy="${lb[1]}" r="4.5" fill="${ledColor(l, l.b)}"/>`;
   if (PREFS.labels) {
-    const d = Math.min(64, len / 2 - 10), [ta, tb] = [pt(A, d), pt(B, -d)], ox = -uy * 11, oy = ux * 11;
+    // On PC cables the switch-port label sits further out, where neighbouring cables have spread apart
+    const swA = !!S.switches[l.a.dev], swB = !!S.switches[l.b.dev], near = Math.min(44, len / 2 - 10), far = Math.min(len * 0.42, len - 60);
+    const da = swA && !swB ? far : swA ? Math.min(64, len / 2 - 10) : near;
+    const db = swB && !swA ? far : swB ? Math.min(64, len / 2 - 10) : near;
+    const [ta, tb] = [pt(A, da), pt(B, -db)], ox = -uy * 11, oy = ux * 11;
     s += `<text class="plabel" x="${ta[0] + ox}" y="${ta[1] + oy}">${l.a.port}</text><text class="plabel" x="${tb[0] + ox}" y="${tb[1] + oy}">${l.b.port}</text>`;
   }
   return s + '</g>';
