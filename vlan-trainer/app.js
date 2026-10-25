@@ -72,23 +72,40 @@ function presetScenario(key) {
   };
 }
 
-function randomScenario(nColors, perColor) {
+// Easy: 2 colors on Switch1 in neat port blocks. Normal: 4 colors spread over the switches. Hard: 6 colors, odd VLAN IDs, 3 servers.
+const LEVELS = {
+  easy: { title: 'Easy', colors: 2, per: 3, s1: 1, servers: 1, blocks: true, simpleIds: true },
+  normal: { title: 'Normal', colors: 4, per: 3, s1: 0.7, servers: 2 },
+  hard: { title: 'Hard', colors: 6, per: 4, s1: 0.5, servers: 3, oddIds: true },
+};
+function levelScenario(level) {
+  const L = LEVELS[level];
+  return { ...randomScenario(L.colors, L.per, L), key: level, title: L.title + ' exam' };
+}
+
+function randomScenario(nColors, perColor, o = {}) {
   const r = Math.random;
   const names = ['BLUE', 'GREEN', ...shuffle(['RED', 'YELLOW', 'ORANGE', 'PURPLE', 'PINK', 'BROWN'])].slice(0, nColors);
   const schemes = [i => (i + 1) * 100, i => (i + 1) * 10, i => (i + 1) * 11, i => 100 + (i + 1) * 5, i => (i + 2) * 20];
   const scheme = schemes[Math.floor(r() * schemes.length)];
-  const colors = names.map((name, i) => ({ name, vlan: scheme(i) }));
+  const oddIds = shuffle(Array.from({ length: 998 }, (_, i) => i + 2)).slice(0, nColors);
+  const colors = names.map((name, i) => ({ name, vlan: o.oddIds ? oddIds[i] : o.simpleIds ? (i + 1) * 100 : scheme(i) }));
   const range = Array.from({ length: 22 }, (_, i) => i + 1);
   const pools = { S1: shuffle(range), S2: shuffle(range), S3: shuffle(range) };
+  if (o.blocks) {
+    const start = 1 + Math.floor(r() * (23 - nColors * perColor));
+    pools.S1 = Array.from({ length: nColors * perColor }, (_, i) => start + i).reverse();
+  }
+  const s1 = o.s1 == null ? 0.7 : o.s1;
   const assign = { S1: {}, S2: {}, S3: {} };
   for (const c of colors) {
     for (let j = 0; j < perColor; j++) {
-      let sw = r() < 0.7 ? 'S1' : (r() < 0.5 ? 'S2' : 'S3');
-      if (pools[sw].length <= (sw === 'S3' ? 3 : 0)) sw = SW_IDS.find(s => pools[s].length > (s === 'S3' ? 3 : 0));
+      let sw = r() < s1 ? 'S1' : (r() < 0.5 ? 'S2' : 'S3');
+      if (pools[sw].length <= (sw === 'S3' ? 4 : 0)) sw = SW_IDS.find(s => pools[s].length > (s === 'S3' ? 4 : 0));
       (assign[sw][c.name] = assign[sw][c.name] || []).push('Fa0/' + pools[sw].pop());
     }
   }
-  const nServers = nColors >= 2 && r() < 0.65 ? 2 : 1;
+  const nServers = Math.min(nColors, o.servers || (nColors >= 2 && r() < 0.65 ? 2 : 1));
   const servers = colors.slice(0, nServers).map((c, i) => ({ color: c.name, ip: NET + (2 + i), name: c.name + ' ENROLLMENT' }));
   return { key: `random-${nColors}x${perColor}`, title: `Random, ${nColors} colors`, seed: Math.floor(r() * 1e9), colors, assign, servers };
 }
@@ -1161,18 +1178,18 @@ function openWin(id) {
   api.focus();
 }
 
-// Windows open on Physical, like Packet Tracer, so you have to click CLI or Desktop yourself
-function tabbed(body, names, panes, onShow) {
+// Like Packet Tracer: a device opens on Physical the first time, then on whichever tab you used last
+function tabbed(body, names, panes, onShow, node) {
   let cur = 0;
   const btns = names.map((n, i) => h('button', { type: 'button', role: 'tab', class: 'wtab', onclick: () => show(i) }, n));
   body.append(h('div', { class: 'win-tabs', role: 'tablist' }, ...btns), ...panes);
   function show(i) {
-    cur = i;
+    cur = node.tab = i;
     btns.forEach((b, j) => { b.classList.toggle('on', i === j); b.setAttribute('aria-selected', String(i === j)); });
     panes.forEach((p, j) => { p.hidden = i !== j; });
     onShow(i);
   }
-  show(0);
+  show(node.tab || 0);
   return { current: () => cur, focus: () => btns[cur].focus() };
 }
 function infoPane(text) { return h('div', { class: 'pane' }, h('p', { class: 'pane-note' }, text)); }
@@ -1207,7 +1224,7 @@ function buildCli(sw, body) {
   const phys = h('div', { class: 'pane' });
   const tabs = tabbed(body, ['Physical', 'Config', 'CLI', 'Attributes'],
     [phys, configPane(sw), cliPane, infoPane('Attributes are not used in this exam.')],
-    i => { if (i === 0) physicalPane(sw, phys); if (i === 2) { inp.focus(); term.scrollTop = term.scrollHeight; } });
+    i => { if (i === 0) physicalPane(sw, phys); if (i === 2) { inp.focus(); term.scrollTop = term.scrollHeight; } }, sw);
   pre.textContent = sw.cli.buf.join('\n') + '\n';
   sw.cli.view = { pre, pr, inp, term };
   refreshPrompt(sw);
@@ -1275,7 +1292,7 @@ function buildDesktop(d, body) {
   const phys = h('div', { class: 'pane' });
   const tabs = tabbed(body, ['Physical', 'Config', 'Desktop', d.type === 'server' ? 'Services' : 'Programming', 'Attributes'],
     [phys, configPane(d), view, infoPane('Not used in this exam.'), infoPane('Attributes are not used in this exam.')],
-    i => { if (i === 0) physicalPane(d, phys); if (i === 2) { const f = view.querySelector('input') || view.querySelector('button'); if (f) f.focus(); } });
+    i => { if (i === 0) physicalPane(d, phys); if (i === 2) { const f = view.querySelector('input') || view.querySelector('button'); if (f) f.focus(); } }, d);
   const appBar = (title, back) => h('div', { class: 'app-bar' }, h('span', {}, title), h('button', { class: 'app-x', type: 'button', 'aria-label': 'Close ' + title, onclick: back }, '×'));
   const ICONS = {
     ip: '<svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><rect x="3" y="6" width="28" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><text x="17" y="19" font-size="9" text-anchor="middle" fill="currentColor" font-family="monospace">IP</text><path d="M12 29h10M17 24v5" stroke="currentColor" stroke-width="2"/></svg>',
@@ -1398,7 +1415,7 @@ function newRun() {
   closeAll(); closePicker();
   $('#done').hidden = true;
   const m = PREFS.mode;
-  const sc = m === 'random' ? randomScenario(PREFS.nColors, PREFS.perColor) : presetScenario(m);
+  const sc = m === 'random' ? randomScenario(PREFS.nColors, PREFS.perColor) : LEVELS[m] ? levelScenario(m) : presetScenario(m);
   startRun(sc, PREFS.ips);
   setTool('select');
   renderSheet(); renderEvents(); renderStatus(); renderTimer();
@@ -1427,6 +1444,6 @@ function init() {
   newRun();
 }
 
-if (HEADLESS) globalThis.VST = { get S() { return S; }, startRun, presetScenario, randomScenario, submit, addLink, removeLink, runChecks, canReach, answerFor, attach, parseIfs };
+if (HEADLESS) globalThis.VST = { get S() { return S; }, startRun, presetScenario, randomScenario, levelScenario, submit, addLink, removeLink, runChecks, canReach, answerFor, attach, parseIfs };
 else init();
 })();
