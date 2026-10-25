@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VLAN Speed Trainer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <svg width="30" height="22" viewBox="0 0 30 22" aria-hidden="true"><rect x="1" y="8" width="9" height="6" rx="1" fill="var(--accent)"/><rect x="20" y="8" width="9" height="6" rx="1" fill="var(--accent)"/><rect x="10.5" y="1" width="9" height="6" rx="1" fill="var(--ok)"/><rect x="10.5" y="15" width="9" height="6" rx="1" fill="var(--warn)"/><path d="M10 11h10M15 7v8" stroke="var(--ink)" stroke-width="1.2"/></svg>
+      <h1>VLAN Speed Trainer</h1>
+    </div>
+    <div class="controls">
+      <label for="mode">Exam
+        <select id="mode">
+          <option value="exam20">20 PC Exam (5 colors)</option>
+          <option value="quiz">Original quiz (6 PCs)</option>
+          <option value="random">Random</option>
+        </select>
+      </label>
+      <span id="randOpts" class="controls" hidden>
+        <label for="nColors">Colors <select id="nColors"></select></label>
+        <label for="perColor">PCs per color <select id="perColor"></select></label>
+      </span>
+      <button id="newRun" class="btn primary" type="button">New run</button>
+    </div>
+    <div class="clock">
+      <div class="prog"><span id="progTxt">0 / 0 checks</span><div class="bar"><i id="progBar"></i></div></div>
+      <span id="status" class="chip">Ready</span>
+      <span id="timer">00:00.0</span>
+    </div>
+  </header>
+
+  <div class="body">
+    <aside class="sheet" aria-label="Exam sheet">
+      <div id="steps"></div>
+      <section class="step">
+        <h2>Checklist</h2>
+        <ul id="checks" class="checks"></ul>
+        <button id="checkNow" class="btn" type="button" hidden>Check my work</button>
+      </section>
+      <section class="step">
+        <h2>Options</h2>
+        <div class="opts">
+          <label for="optLive"><input type="checkbox" id="optLive"> Live checklist</label>
+          <label for="optPaste"><input type="checkbox" id="optPaste"> Allow paste in the CLI</label>
+          <label for="optLabels"><input type="checkbox" id="optLabels"> Show port labels</label>
+          <label for="optIps"><input type="checkbox" id="optIps"> PCs and servers come with IPs set (applies on New run)</label>
+        </div>
+      </section>
+      <section class="step">
+        <h2>Keys</h2>
+        <div class="keys">
+          <kbd>Tab</kbd><span>Finish a command word</span>
+          <kbd>↑ ↓</kbd><span>Previous / next command</span>
+          <kbd>?</kbd><span>List what you can type next</span>
+          <kbd>Ctrl+Z</kbd><span>Same as <span class="mono">end</span></span>
+          <kbd>Ctrl+Shift+6</kbd><span>Break out of the typo freeze</span>
+          <kbd>Ctrl+A / Ctrl+E</kbd><span>Jump to start / end of the line</span>
+          <kbd>Ctrl+U</kbd><span>Delete from the cursor back to the start</span>
+          <kbd>Ctrl+Backspace</kbd><span>Delete the last word (Ctrl+W in real PT)</span>
+          <kbd>Ctrl+F6</kbd><span>Leave the CLI box</span>
+          <kbd>Ctrl+click</kbd><span>On the cable tool: keep it selected</span>
+          <kbd>Esc</kbd><span>Cancel and go back to Select</span>
+          <kbd>Hover</kbd><span>A device shows its IP and cable port</span>
+          <kbd>Orange light</kbd><span>New cable still waiting (30 s). Press Fast Forward Time.</span>
+        </div>
+      </section>
+      <section class="step">
+        <details class="key" id="keyBox">
+          <summary>Answer key (open after your run)</summary>
+          <div id="keyBody"></div>
+        </details>
+      </section>
+    </aside>
+
+    <section class="stage" aria-label="Workspace">
+      <div class="ws-wrap"><svg id="ws" xmlns="http://www.w3.org/2000/svg" role="application" aria-label="Logical workspace"></svg></div>
+      <div class="toolbar" role="toolbar" aria-label="Tools">
+        <button class="tool" type="button" data-tool="select" aria-pressed="true">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5l9.5 7-4.2.6 2.4 4.6-1.8.9-2.4-4.6L3 12.8z" fill="currentColor"/></svg>Select
+        </button>
+        <button class="tool" type="button" data-tool="cable" aria-pressed="false" title="Ctrl+click to keep it selected">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 14C6 14 4 2 8 2s2 12 6 12" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="2" cy="14" r="1.6" fill="currentColor"/><circle cx="14" cy="14" r="1.6" fill="currentColor"/></svg>Copper Straight-Through <span class="stk" id="stk" hidden>sticky</span>
+        </button>
+        <button class="tool" type="button" data-tool="delete" aria-pressed="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3l10 10M13 3L3 13" stroke="currentColor" stroke-width="2"/></svg>Delete cable
+        </button>
+        <button class="tool" type="button" data-tool="pdu" aria-pressed="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="3.5" width="13" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2 4l6 5 6-5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Add Simple PDU
+        </button>
+        <button class="tool" type="button" id="ffwd" title="Skip the orange STP wait">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 3v10l6-5zM8.5 3v10l6-5z" fill="currentColor"/></svg>Fast Forward Time
+        </button>
+        <span class="hint" id="hint">Click a device to open it.</span>
+      </div>
+      <div class="events">
+        <table>
+          <thead><tr><th>Last status</th><th>Source</th><th>Destination</th><th>Type</th><th>Num</th></tr></thead>
+          <tbody id="evBody"></tbody>
+        </table>
+      </div>
+      <div class="done" id="done" hidden>
+        <div class="done-card">
+          <p>All checks passed</p>
+          <div class="big" id="doneTime">00:00.0</div>
+          <p id="doneBest"></p>
+          <div class="row"><button class="btn primary" type="button" id="doneNew">New run</button><button class="btn" type="button" id="doneClose">Look around</button></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+<div id="layer"></div>
+<div id="picker" class="picker" hidden role="menu"></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
